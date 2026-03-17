@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  shesher:
+    build: .
+    container_name: shesher-os
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./workspaces:/app/workspaces  # Maps your local tools to the container
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY} # Passes your key in safely
+    restart: unless-stopped

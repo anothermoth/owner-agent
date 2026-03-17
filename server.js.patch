@@ -1,0 +1,47 @@
+--- server.js
++++ server.js
+@@ -7,6 +7,7 @@
+ import path from "path";
+ import { exec } from "child_process";
+ import util from "util";
++import OpenAI from "openai";
+ 
+ const execAsync = util.promisify(exec);
+ 
+@@ -16,6 +17,11 @@
+ const io = new Server(httpServer);
+ 
+ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
++const xai = new OpenAI({
++  apiKey: process.env.XAI_API_KEY || "dummy",
++  baseURL: "https://api.x.ai/v1",
++});
++app.use(express.json());
+ 
+ const systemInstruction = `You are "shesher", an AI operating system living inside a browser.
+ You will receive ACTIVE TOOLS, CURRENT HTML STATE, and a USER COMMAND.
+@@ -35,6 +41,25 @@
+ });
+ let chatSession = model.startChat({ history: [] });
+ 
++// --- OWNER.COM DEMO XAI ENDPOINT ---
++app.post("/api/xai-chat", async (req, res) => {
++  const { messages } = req.body;
++  try {
++    const response = await xai.chat.completions.create({
++      model: "grok-beta",
++      messages: [
++        { role: "system", content: "You are an AI restaurant answering service for Luigi's Pizza. You take orders, answer questions about the menu, and help book tables. Be concise, polite, and helpful." },
++        ...messages
++      ],
++      temperature: 0.7
++    });
++    res.json({ reply: response.choices[0].message.content });
++  } catch (error) {
++    console.error("xAI Error:", error);
++    res.status(500).json({ error: error.message });
++  }
++});
++
+ // The Architect's Tool-Builder Model (Separate from the main conversational agent)
+ const toolBuilderModel = genAI.getGenerativeModel({

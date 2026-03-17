@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Shesher Console</title>
+    <style>
+      body {
+        background-color: #050505;
+        color: #00ff00;
+        font-family: "Courier New", Courier, monospace;
+        margin: 0;
+        padding: 20px;
+        overflow-x: hidden;
+      }
+      #container {
+        width: 100%;
+        height: 100%;
+        position: relative;
+      }
+    </style>
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="https://unpkg.com/@isomorphic-git/lightning-fs"></script>
+    <script src="/init-demo.js"></script>
+    <script>
+      // Generate or retrieve a persistent Session ID for the workspace
+      let sessionId = localStorage.getItem("shesher_session_id");
+      if (!sessionId) {
+        sessionId = "workspace_" + Math.random().toString(36).substring(2, 10);
+        localStorage.setItem("shesher_session_id", sessionId);
+      }
+
+      // Pass it to The Architect
+      const socket = io({ query: { sessionId } });
+
+      // The custom Promise wrapper for fluent chaining
+      class SheshChain {
+        constructor(promise) {
+          this.promise = promise;
+        }
+        then(onFulfilled, onRejected) {
+          return new SheshChain(this.promise.then(onFulfilled, onRejected));
+        }
+        catch(onRejected) {
+          return new SheshChain(this.promise.catch(onRejected));
+        }
+        // Chain another prompt
+        prompt(message, retries = 3) {
+          return new SheshChain(
+            this.promise.then(() =>
+              globalThis.shesh._executePrompt(message, retries)
+            )
+          );
+        }
+        // Chain a switch router
+        switch(routingFn) {
+          return new SheshChain(
+            this.promise.then(async (result) => {
+              const nextStep = await routingFn(result);
+              // If the router returns a string, assume it's a new prompt
+              if (typeof nextStep === "string") {
+                return globalThis.shesh._executePrompt(nextStep);
+              }
+              // Otherwise, pass the value down the chain
+              return nextStep;
+            })
+          );
+        }
+      }
+
+      globalThis.shesh = {
+        // --- CORE OS COMPILER ---
+        buildWorkspaceProject: async (projectName, files) => {
+            await globalThis.shesh._ensureFS();
+            const fs = window.fs.promises;
+            
+            try { await fs.mkdir(`/projects/${projectName}`, { recursive: true }); } catch (e) { /* Ignore exists */ }
+            
+            for (const [filename, content] of Object.entries(files)) {
+                await fs.writeFile(`/projects/${projectName}/${filename}`, content);
+            }
+            
+            globalThis.shesh.activeProject = projectName;
+            
+            const container = document.getElementById('container');
+            container.style.margin = '0'; 
+            container.style.padding = '0'; 
+            container.style.height = '100vh'; 
+            container.style.overflow = 'hidden';
+            container.innerHTML = `<iframe src="/~fs/projects/${projectName}/index.html" style="width: 100%; height: 100%; border: none; display: block; background: #111;"></iframe>`;
+            
+            console.log(`%c[Shesher] Workspace '${projectName}' compiled & mounted.`, "color: #00ff00; font-weight: bold;");
+        },
+        activeProject: null,
+        // --- FILESYSTEM BOOTSTRAPPER ---
+        _ensureFS: async () => {
+            if (!window.fs) {
+                window.fs = new LightningFS('shesher_data');
+                console.log("%c[Shesher] Virtual Filesystem Mounted.", "color: #b026ff;");
+            }
+        },
+        // --- NEW: THE REGISTRY ---
+        registry: {
+          client: new Set(), // Track loaded client tool URLs/names
+          server: [], // Track available server tools
+        },
+        // --- ADD ABORT FLAG ---
+        _abortFlag: false,
+
+        // --- NEW: STOP EXECUTION ---
+        stop: () => {
+          globalThis.shesh._abortFlag = true;
+          globalThis.shesh._setStatus("Aborted by user.");
+          setTimeout(() => globalThis.shesh._clearStatus(), 1500);
+          console.log(
+            "%c[Shesher] Execution aborted.",
+            "color: #ff0000; font-weight: bold;"
+          );
+        },
+
+        // --- UPGRADED TYPING BUBBLE ---
+        _setStatus: (message) => {
+          if (!globalThis.shesh.config.showTypingIndicator) return;
+
+          let bubble = document.getElementById("shesher-typing-bubble");
+
+          if (!bubble) {
+            bubble = document.createElement("div");
+            bubble.id = "shesher-typing-bubble";
+            bubble.innerHTML = `
+                    <style>
+                        #shesher-typing-bubble {
+                            position: fixed; bottom: 20px; left: 20px; z-index: 999999;
+                            background: rgba(15, 15, 20, 0.85); backdrop-filter: blur(8px);
+                            border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 20px;
+                            padding: 10px 16px; color: #fff; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                            font-size: 13px; display: flex; align-items: center; gap: 15px;
+                            box-shadow: 0 4px 15px rgba(0,0,0,0.3); transition: opacity 0.2s;
+                        }
+                        .sh-dots { display: flex; gap: 4px; }
+                        .sh-dot { width: 5px; height: 5px; background: #00ffff; border-radius: 50%; animation: sh-bounce 1.4s infinite ease-in-out both; }
+                        .sh-dot:nth-child(1) { animation-delay: -0.32s; }
+                        .sh-dot:nth-child(2) { animation-delay: -0.16s; }
+                        @keyframes sh-bounce { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1); } }
+                        .sh-stop-btn {
+                            background: rgba(255, 0, 0, 0.2); border: 1px solid rgba(255,0,0,0.5); 
+                            color: #ffaaaa; border-radius: 50%; width: 20px; height: 20px; 
+                            display: flex; justify-content: center; align-items: center; 
+                            cursor: pointer; font-size: 10px; font-weight: bold; padding: 0; transition: 0.2s;
+                        }
+                        .sh-stop-btn:hover { background: rgba(255, 0, 0, 0.6); color: white; transform: scale(1.1); }
+                    </style>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <div class="sh-dots"><div class="sh-dot"></div><div class="sh-dot"></div><div class="sh-dot"></div></div>
+                        <span id="shesher-bubble-text"></span>
+                    </div>
+                    <button class="sh-stop-btn" onclick="globalThis.shesh.stop()" title="Stop Execution">X</button>
+                `;
+            document.documentElement.appendChild(bubble);
+          }
+
+          document.getElementById("shesher-bubble-text").innerText = message;
+          bubble.style.opacity = "1";
+        },
+
+        // --- NEW FLUENT ENTRY POINT ---
+        prompt: (message, retries = 3) => {
+          return new SheshChain(
+            Promise.resolve().then(() =>
+              globalThis.shesh._executePrompt(message, retries)
+            )
+          );
+        },
+
+        // --- UPGRADED PROMPT (BOOTSTRAPPING THE AGENT) ---
+        _executePrompt: async (message, retries = 3) => {
+            globalThis.shesh._abortFlag = false;
+            
+            if (retries < 3) {
+                console.log(`%c[Shesher] Healing... (${retries})`, "color: #ffa500;");
+                globalThis.shesh._setStatus(`Healing error... (${retries} attempts left)`);
+            } else {
+                globalThis.shesh._setStatus('Thinking...');
+            }
+            
+           // 1. DEFINE THE VARIABLES (so we never get a ReferenceError again)
+            // If you add a system to fetch forged tools from the server later, 
+            // you will populate these variables. For now, they start empty.
+            let activeClientTools = ""; 
+            let activeServerTools = "";
+
+            // 2. DEFINE THE KERNEL TOOLS (Baked into the OS)
+            const kernelTools = "shesh.buildWorkspaceProject(projectName, filesObject)";
+            
+            // 3. COMBINE THEM SAFELY
+            const finalClientTools = activeClientTools ? `${kernelTools}, ${activeClientTools}` : kernelTools;
+
+            // 4. BUILD THE CONTEXT STRING
+            const toolString = `
+                CLIENT TOOLS: ${finalClientTools}
+                SERVER TOOLS: ${activeServerTools || "None"}
+            `.trim();
+
+            let currentDOM = document.getElementById('container') ? document.getElementById('container').innerHTML : "";
+            let contextPayload = "";
+
+            // --- THE DYNAMIC X-RAY CONTEXT INJECTOR ---
+            if (globalThis.shesh.activeProject) {
+                await globalThis.shesh._ensureFS();
+                const fs = window.fs.promises;
+                const p = globalThis.shesh.activeProject;
+                try {
+                    const dirFiles = await fs.readdir(`/projects/${p}`);
+                    let fileContents = "";
+                    for (const file of dirFiles) {
+                        // Skip reading subdirectories if Shesher makes them, just to be safe
+                        const stat = await fs.stat(`/projects/${p}/${file}`);
+                        if (!stat.isDirectory()) {
+                            const content = await fs.readFile(`/projects/${p}/${file}`, 'utf8');
+                            fileContents += `\n--- ${file} ---\n${content}\n`;
+                        }
+                    }
+                    contextPayload = `\n\n[SYSTEM CONTEXT: You are editing ACTIVE PROJECT: '${p}'. Current files on disk:\n${fileContents}\nWhen updating, use shesh.buildWorkspaceProject('${p}', { 'index.html': '...', 'app.js': '...', 'demo.js': '...' }) and provide the code for ALL files in the object so they are overwritten cleanly. Make sure your index.html includes relative tags like <script src="app.js"><\/script> as you are responsible for linking them now.]`;
+                } catch(e) {
+                    console.warn("[Shesher] Could not read active project files.");
+                }
+            }
+
+            // Append the X-Ray context secretly to the user's message
+            const finalCommand = message + contextPayload;
+            const payload = { command: finalCommand, dom: currentDOM, tools: toolString };
+
+            return new Promise((resolve, reject) => {
+                socket.emit('prompt', payload, async (response) => {
+                    if (globalThis.shesh._abortFlag) {
+                        return reject(new Error("Execution aborted by user."));
+                    }
+                    
+                    globalThis.shesh._clearStatus(); 
+
+                    if (response.success) {
+                        try {
+                            const result = eval(`(async () => { \n${response.code}\n })();`);
+                            resolve(result !== undefined ? result : "Execution complete.");
+                        } catch (e) {
+                            if (retries > 0) {
+                                const fixPrompt = `The code threw this error: "${e.message}". Rewrite to fix. No markdown.`;
+                                resolve(await globalThis.shesh._executePrompt(fixPrompt, retries - 1));
+                            } else reject(e);
+                        }
+                    } else reject(response.error);
+                });
+            });
+        },
+        // --- NEW: UNLOAD CLIENT TOOL ---
+        unloadTool: (identifier) => {
+          // Identifier can be the URL or the function name (e.g., 'flashScreen')
+
+          // 1. Remove the script tag
+          const script = document.querySelector(
+            `script[data-shesher-tool*="${identifier}"]`
+          );
+          if (script) {
+            const url = script.dataset.shesherTool;
+            script.remove();
+            globalThis.shesh.registry.client.delete(url);
+
+            // If it was a CDN, remove from localStorage
+            let savedTools = JSON.parse(
+              localStorage.getItem("shesher_tools") || "[]"
+            );
+            savedTools = savedTools.filter((t) => t !== url);
+            localStorage.setItem("shesher_tools", JSON.stringify(savedTools));
+          }
+
+          // 2. Nuke it from the global window object if we know the name
+          if (!identifier.includes("/") && window[identifier]) {
+            delete window[identifier];
+          }
+
+          console.log(
+            `%c[Shesher] Tool unloaded: ${identifier}`,
+            "color: #ffa500;"
+          );
+        },
+
+        // --- NEW: DELETE SERVER TOOL ---
+        deleteServerTool: async (name, type) => {
+          return new Promise((resolve, reject) => {
+            socket.emit("deleteServerTool", { name, type }, (response) => {
+              if (response.success) {
+                globalThis.shesh.registry.server =
+                  globalThis.shesh.registry.server.filter(
+                    (t) => t.name !== name
+                  );
+                console.log(
+                  `%c[Shesher] Server tool '${name}' destroyed.`,
+                  "color: #ffa500;"
+                );
+                resolve(true);
+              } else reject(response.error);
+            });
+          });
+        },
+        // --- UPGRADED LOAD TOOL ---
+        loadTool: async (url, save = true) => {
+          return new Promise((resolve, reject) => {
+            if (document.querySelector(`script[src="${url}"]`)) {
+              resolve(); // Already loaded
+              return;
+            }
+
+            const script = document.createElement("script");
+            script.src = url;
+            // Add a data attribute so we can find it easily later
+            script.dataset.shesherTool = url;
+
+            script.onload = () => {
+              console.log(`%c[Shesher] Tool loaded: ${url}`, "color: #00ffff;");
+              globalThis.shesh.registry.client.add(url);
+
+              if (save && !url.startsWith("/workspaces/")) {
+                const savedTools = JSON.parse(
+                  localStorage.getItem("shesher_tools") || "[]"
+                );
+                if (!savedTools.includes(url)) {
+                  savedTools.push(url);
+                  localStorage.setItem(
+                    "shesher_tools",
+                    JSON.stringify(savedTools)
+                  );
+                }
+              }
+              resolve();
+            };
+            script.onerror = () => reject(new Error(`Failed to load ${url}`));
+            document.head.appendChild(script);
+          });
+        }, // NEW: Clear persistent tools
+        clearTools: () => {
+          localStorage.removeItem("shesher_tools");
+          console.log(
+            "%c[Shesher] Tool memory wiped. Run shesh.reset() to apply.",
+            "color: #ffa500;"
+          );
+        },
+
+        // --- TOOL FORGING ---
+        buildTool: async (name, description) => {
+          console.log(
+            `%c[Shesher] Asking The Architect to build tool: ${name}...`,
+            "color: #b026ff;"
+          );
+          return new Promise((resolve, reject) => {
+            socket.emit(
+              "buildTool",
+              { name, description },
+              async (response) => {
+                if (response.success) {
+                  try {
+                    // Automatically load the newly minted tool into the browser
+                    await globalThis.shesh.loadTool(response.path);
+                    console.log(
+                      `%c[Shesher] Tool '${name}' is now available globally!`,
+                      "color: #00ff00; font-weight: bold;"
+                    );
+                    resolve(`Tool ${name} ready.`);
+                  } catch (e) {
+                    reject(e);
+                  }
+                } else {
+                  console.error("[Shesher] Architect failed:", response.error);
+                  reject(response.error);
+                }
+              }
+            );
+          });
+        },
+       
+       // --- APP LAUNCHER ---
+       loadProject: async (projectName) => {
+            await globalThis.shesh._ensureFS();
+            const fs = window.fs.promises;
+            
+            try {
+                // Verify it exists before trying to mount
+                await fs.stat(`/projects/${projectName}/index.html`);
+                
+                // Lock the context!
+                globalThis.shesh.activeProject = projectName;
+                
+                const container = document.getElementById('container');
+                container.style.margin = '0'; 
+                container.style.padding = '0'; 
+                container.style.height = '100vh'; 
+                container.style.overflow = 'hidden';
+                container.innerHTML = `<iframe src="/~fs/projects/${projectName}/index.html" style="width: 100%; height: 100%; border: none; display: block; background: #111;"></iframe>`;
+                
+                console.log(`%c[Shesher] Project '${projectName}' mounted. Context Locked.`, "color: #00ff00; font-weight: bold;");
+                return true;
+            } catch (e) {
+                console.error(`[Shesher] Failed to load '${projectName}'. Directory missing.`);
+                return false;
+            }
+        },
+        // --- SERVER-SIDE TOOLS ---
+        buildServerTool: async (name, type, description) => {
+          if (type !== "node" && type !== "bash")
+            return console.error("[Shesher] Type must be 'node' or 'bash'.");
+          console.log(
+            `%c[Shesher] Instructing The Architect to write a ${type} script: ${name}...`,
+            "color: #ff00ff;"
+          );
+
+          return new Promise((resolve, reject) => {
+            socket.emit(
+              "buildServerTool",
+              { name, type, description },
+              (response) => {
+                if (response.success) {
+                  console.log(
+                    `%c[Shesher] Server tool '${name}' forged and stored securely in your workspace.`,
+                    "color: #00ff00; font-weight: bold;"
+                  );
+                  resolve(true);
+                } else {
+                  console.error("[Shesher] Architect failed:", response.error);
+                  reject(response.error);
+                }
+              }
+            );
+          });
+        },
+
+        invokeServerTool: async (name, type, args = {}) => {
+          console.log(
+            `%c[Shesher] Invoking remote execution of ${name}...`,
+            "color: #ff00ff;"
+          );
+
+          return new Promise((resolve, reject) => {
+            socket.emit(
+              "invokeServerTool",
+              { name, type, args },
+              (response) => {
+                if (response.success) {
+                  console.log(
+                    `%c[Shesher] Execution complete.`,
+                    "color: #00ff00;"
+                  );
+                  resolve(response.result);
+                } else {
+                  console.error(
+                    "[Shesher] Remote execution failed:",
+                    response.error
+                  );
+                  reject(response.error);
+                }
+              }
+            );
+          });
+        },
+        // --- CONFIGURATION ---
+        config: {
+          showTypingIndicator: true,
+        },
+
+        setOptions: (options) => {
+          Object.assign(globalThis.shesh.config, options);
+          console.log(
+            `%c[Shesher] Options updated:`,
+            "color: #00ffff;",
+            globalThis.shesh.config
+          );
+        },
+
+        // --- TYPING INDICATOR UI ---
+        _setStatus: (message) => {
+          if (!globalThis.shesh.config.showTypingIndicator) return;
+
+          let bubble = document.getElementById("shesher-typing-bubble");
+
+          // If the AI destroyed it, rebuild it
+          if (!bubble) {
+            bubble = document.createElement("div");
+            bubble.id = "shesher-typing-bubble";
+            bubble.innerHTML = `
+                    <style>
+                        #shesher-typing-bubble {
+                            position: fixed; bottom: 20px; left: 20px; z-index: 999999;
+                            background: rgba(15, 15, 20, 0.85); backdrop-filter: blur(8px);
+                            border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 20px;
+                            padding: 10px 16px; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                            font-size: 13px; display: flex; align-items: center; gap: 10px;
+                            box-shadow: 0 4px 15px rgba(0,0,0,0.3); transition: opacity 0.2s; pointer-events: none;
+                        }
+                        .sh-dots { display: flex; gap: 4px; }
+                        .sh-dot { width: 5px; height: 5px; background: #00ffff; border-radius: 50%; animation: sh-bounce 1.4s infinite ease-in-out both; }
+                        .sh-dot:nth-child(1) { animation-delay: -0.32s; }
+                        .sh-dot:nth-child(2) { animation-delay: -0.16s; }
+                        @keyframes sh-bounce { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1); } }
+                    </style>
+                    <div class="sh-dots"><div class="sh-dot"></div><div class="sh-dot"></div><div class="sh-dot"></div></div>
+                    <span id="shesher-bubble-text"></span>
+                `;
+            // Append directly to the document element, outside the body, so body.innerHTML = '' won't kill it!
+            document.documentElement.appendChild(bubble);
+          }
+
+          document.getElementById("shesher-bubble-text").innerText = message;
+          bubble.style.opacity = "1";
+        },
+
+        _clearStatus: () => {
+          const bubble = document.getElementById("shesher-typing-bubble");
+          if (bubble) bubble.style.opacity = "0";
+        },
+
+        // --- LOCAL VIRTUAL FILESYSTEM TREE ---
+        localTree: async () => {
+          await globalThis.shesh._ensureFS();
+          const fs = window.fs.promises;
+
+          const buildTree = async (dir, prefix = "") => {
+            let treeStr = "";
+            try {
+              const entries = await fs.readdir(dir);
+              for (let i = 0; i < entries.length; i++) {
+                const file = entries[i];
+                const isLast = i === entries.length - 1;
+                const fullPath = `${dir === "/" ? "" : dir}/${file}`;
+                const stat = await fs.stat(fullPath);
+
+                treeStr += `${prefix}${isLast ? "└── " : "├── "}${file}\n`;
+
+                if (stat.isDirectory()) {
+                  treeStr += await buildTree(
+                    fullPath,
+                    prefix + (isLast ? "    " : "│   ")
+                  );
+                }
+              }
+            } catch (e) {
+              treeStr += `${prefix}└── [Error reading directory]\n`;
+            }
+            return treeStr;
+          };
+
+          const result = ".\n" + (await buildTree("/"));
+          console.log(
+            "%c--- VIRTUAL BROWSER FILESYSTEM ---",
+            "color: #b026ff; font-weight: bold;"
+          );
+          console.log(`%c${result}`, "color: #cccccc; font-family: monospace;");
+          console.log(
+            "%c----------------------------------",
+            "color: #b026ff; font-weight: bold;"
+          );
+          return result;
+        },
+
+        // THE TRUE RESET
+        reset: async () => {
+          return new Promise((resolve) => {
+            socket.emit("reset", (res) => {
+              if (res.success) {
+                console.log(
+                  "%c[Shesher] Server memory wiped. Rebooting Matrix...",
+                  "color: #00ffff; font-weight: bold;"
+                );
+                // Hard reload wipes all rogue styles, intervals, and memory leaks
+                window.location.reload();
+              }
+            });
+          });
+        },
+      };
+
+      // --- UPGRADED BOOT SEQUENCE ---
+      window.onload = async () => {
+        console.log("%c[Shesher] Booting system...", "color: #888888;");
+
+        // --- NEW: REGISTER THE SERVICE WORKER ---
+        if ("serviceWorker" in navigator) {
+          try {
+            // Register the worker at the root scope
+            await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+            console.log(
+              "%c[Shesher] Service Worker installed. Virtual routing active.",
+              "color: #00ffff; font-weight: bold;"
+            );
+
+            // If this is the very first time loading, the page might not be fully controlled yet.
+            // clients.claim() in the SW usually handles this, but a quick check is good.
+            if (!navigator.serviceWorker.controller) {
+              console.warn(
+                "%c[Shesher] Hard reloading to finalize Service Worker control...",
+                "color: #ffa500;"
+              );
+              window.location.reload();
+              return;
+            }
+          } catch (e) {
+            console.error("[Shesher] Service Worker registration failed:", e);
+          }
+        }
+        const savedTools = JSON.parse(
+          localStorage.getItem("shesher_tools") || "[]"
+        );
+        for (const url of savedTools) {
+          if (!url.startsWith("/workspaces/")) await shesh.loadTool(url, false);
+        }
+
+        socket.emit("getArchitectTools", async (response) => {
+          if (response.success) {
+            // DEFENSIVE FIX: Fallback to empty arrays if undefined
+            const serverTools = response.serverTools || [];
+            const clientTools = response.clientTools || [];
+
+            globalThis.shesh.registry.server = serverTools;
+
+            if (clientTools.length > 0) {
+              console.log(
+                `%c[Shesher] Syncing ${clientTools.length} client tools...`,
+                "color: #b026ff;"
+              );
+              for (const toolUrl of clientTools) {
+                await shesh.loadTool(toolUrl, false);
+              }
+            }
+            console.log(
+              `%c[Shesher] Architect synced. Found ${serverTools.length} server tools.`,
+              "color: #b026ff;"
+            );
+          } else {
+            console.error("[Shesher] Architect sync failed:", response.error);
+          }
+
+          console.log(
+            "%c========================================",
+            "color: #00ff00"
+          );
+          console.log(
+            "%c  SHESHER ONLINE (REGISTRY SYNCED)      ",
+            "color: #00ff00; font-weight: bold;"
+          );
+          console.log(
+            "%c========================================",
+            "color: #00ff00"
+          );
+        });
+      };
+    </script>
+  </head>
+  <body>
+    <div id="container"></div>
+  </body>
+</html>
